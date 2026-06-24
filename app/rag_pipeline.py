@@ -1,6 +1,7 @@
 """
 rag_pipeline.py
-Core RAG logic + Fit Score + Skill Gap Coaching + Resume Tailoring, powered by Groq LLM.
+Core RAG logic + Fit Score + Resume Tailoring + Cover Letter + Interview Prep,
+powered by Groq LLM. General chat responses stream live, like ChatGPT.
 """
 
 import os
@@ -50,17 +51,36 @@ def calculate_fit_score(resume_text, jd_text):
 
 
 def tailor_resume(resume_text, jd_text, fit_analysis):
+    # Hard safety check: refuse to proceed if resume content looks insufficient,
+    # rather than letting the LLM fill gaps with invented experience.
+    if not resume_text or len(resume_text.strip()) < 100:
+        return (
+            "I can't generate a tailored resume right now - the resume text I have is too short "
+            "or empty, which usually means the PDF didn't extract properly. Could you re-attach "
+            "your resume, or paste its text directly into the chat?"
+        )
+
     tailor_prompt = (
         "You are an expert ATS resume writer. Rewrite the RESUME below into a complete, "
         "polished, ATS-friendly resume tailored specifically for the JOB DESCRIPTION provided. "
         "Use the FIT ANALYSIS to know what to emphasize and what gaps to handle gracefully.\n\n"
-        "ORIGINAL RESUME:\n" + resume_text + "\n\n"
+        "ORIGINAL RESUME (this is the ONLY source of the candidate's real experience):\n"
+        "-----\n" + resume_text + "\n-----\n\n"
         "JOB DESCRIPTION:\n" + jd_text + "\n\n"
         "FIT ANALYSIS:\n" + fit_analysis + "\n\n"
+        "CRITICAL RULE - READ CAREFULLY:\n"
+        "Every single company name, job title, date, project name, skill, and metric in your output "
+        "MUST come from the ORIGINAL RESUME text above. If the original resume does not mention a "
+        "specific company, job title, or project, you must NOT invent one. If the original resume's "
+        "experience section is thin, missing, or unclear, keep your output thin too - reflect reality, "
+        "do not pad it with fabricated jobs or projects. If you are about to write a company name, "
+        "job title, or achievement that you cannot point to directly in the ORIGINAL RESUME text "
+        "above, delete it and do not include it. A resume with less content but 100% truthful is "
+        "far better than a padded resume with invented experience.\n\n"
         "Rules:\n"
         "- Output a COMPLETE, ready-to-use resume, not suggestions or comparisons.\n"
         "- Use these exact section headings, in this order, only if the original resume has "
-        "relevant content for them (skip empty sections):\n"
+        "relevant content for them (skip sections with no real content - do not invent content to fill them):\n"
         "  ## Professional Summary\n"
         "  ## Skills\n"
         "  ## Experience\n"
@@ -68,14 +88,15 @@ def tailor_resume(resume_text, jd_text, fit_analysis):
         "  ## Education\n"
         "  ## Certifications\n"
         "- Professional Summary: 2-3 lines, written using strong keywords directly from the "
-        "job description, truthfully reflecting the candidate's real background.\n"
-        "- Skills: list skills from the original resume, reordered/regrouped to surface the ones "
-        "most relevant to this JD first. You may rename a skill to match the JD's exact wording "
-        "ONLY if it is genuinely the same skill (e.g. 'Generative AI' to match JD phrasing for "
-        "the candidate's existing LLM/RAG project work). Never add a skill the candidate doesn't have.\n"
-        "- Experience and Projects: rewrite each bullet point using strong action verbs and JD "
-        "keywords where truthfully applicable, keeping all facts, numbers, and outcomes from the "
-        "original. Do not invent metrics, responsibilities, or outcomes not present in the original.\n"
+        "job description, truthfully reflecting ONLY the candidate's real background as written "
+        "in the original resume.\n"
+        "- Skills: list skills from the original resume only, reordered/regrouped to surface the ones "
+        "most relevant to this JD first. Never add a skill the candidate doesn't have.\n"
+        "- Experience and Projects: rewrite each bullet point that EXISTS in the original using "
+        "stronger action verbs and JD keywords where truthfully applicable, keeping all facts, "
+        "numbers, and outcomes from the original exactly as given. Do not invent metrics, "
+        "responsibilities, companies, or outcomes not present in the original. If the candidate has "
+        "no formal work experience, OMIT the Experience section entirely rather than inventing one.\n"
         "- Education and Certifications: keep exactly as in the original, just reformatted cleanly.\n"
         "- Formatting: use '## ' for section headings and '- ' for bullet points. No tables, "
         "no colors, no graphics - this must be ATS-parseable plain structured text.\n"
@@ -85,14 +106,86 @@ def tailor_resume(resume_text, jd_text, fit_analysis):
     response = client.chat.completions.create(
         model=GROQ_MODEL,
         messages=[
-            {"role": "system", "content": "You are a precise ATS resume writer. Never fabricate experience, skills, or metrics. Output only the resume itself, no commentary."},
+            {"role": "system", "content": (
+                "You are a precise ATS resume writer. You NEVER invent companies, job titles, dates, "
+                "projects, skills, or metrics that are not explicitly present in the candidate's original "
+                "resume text provided to you. If the original resume is thin or has no work experience, "
+                "your output stays thin and honest rather than padded with fabricated content. Fabricating "
+                "experience is a serious failure - the candidate could be asked about it in a real interview "
+                "and caught lying. Output only the resume itself, no commentary."
+            )},
             {"role": "user", "content": tailor_prompt}
         ],
-        temperature=0.3,
-        max_tokens=1400,
+        temperature=0.1,
+        max_tokens=2500,
     )
 
-    return response.choices[0].message.content.strip()
+    result = response.choices[0].message.content.strip()
+    was_truncated = response.choices[0].finish_reason == "length"
+
+    # Safety check: retry if the model either got cut off due to length, or
+    # didn't follow the '## Heading' format we need for proper docx rendering.
+    needs_retry = was_truncated or "## " not in result
+
+    if needs_retry:
+        retry_prompt = tailor_prompt + (
+            "\n\nIMPORTANT: Be concise and efficient with wording so the FULL resume fits completely - "
+            "every section must be fully completed, never cut off partway through. Use '## ' for each "
+            "section heading on its own line, exactly as instructed above."
+        )
+        retry_response = client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=[
+                {"role": "system", "content": (
+                    "You are a precise ATS resume writer. You NEVER invent companies, job titles, dates, "
+                    "projects, skills, or metrics not in the original resume. You ALWAYS use '## Heading' "
+                    "format for sections, and you ALWAYS complete every section fully - never stop mid-list "
+                    "or mid-sentence. Output only the resume itself, no commentary."
+                )},
+                {"role": "user", "content": retry_prompt}
+            ],
+            temperature=0.1,
+            max_tokens=3000,
+        )
+        retry_result = retry_response.choices[0].message.content.strip()
+        retry_truncated = retry_response.choices[0].finish_reason == "length"
+
+        # Use the retry only if it's actually better (not also truncated, or longer than original)
+        if not retry_truncated or len(retry_result) > len(result):
+            result = retry_result
+
+    warning = _check_for_likely_fabrication(result, resume_text)
+    if warning:
+        result = warning + "\n\n" + result
+
+    return result
+
+
+def _check_for_likely_fabrication(tailored_text, original_resume_text):
+    """
+    Lightweight heuristic check: looks for an 'Experience' section in the
+    tailored output that wasn't present at all in the original resume, which
+    strongly suggests fabricated work history. Returns a warning string if
+    suspicious, or None if it looks fine.
+    """
+    original_lower = original_resume_text.lower()
+    tailored_lower = tailored_text.lower()
+
+    original_has_experience_signals = any(
+        signal in original_lower for signal in
+        ["intern", "experience", "worked at", "employed", "company", "present)", "- present"]
+    )
+
+    tailored_has_experience_section = "## experience" in tailored_lower
+
+    if tailored_has_experience_section and not original_has_experience_signals:
+        return (
+            "⚠️ Heads up: this tailored resume includes an Experience section, but I couldn't "
+            "find clear work experience in your original resume. Please double-check this section "
+            "carefully before using it - if anything looks unfamiliar, let me know and I'll regenerate "
+            "it without that section."
+        )
+    return None
 
 
 def generate_cover_letter(resume_text, jd_text, fit_analysis):
@@ -168,23 +261,11 @@ def generate_interview_prep(resume_text, jd_text, fit_analysis):
     return response.choices[0].message.content.strip()
 
 
-def chat_response(user_message, faiss_index, chunks, jd_text, resume_text, fit_analysis, chat_history):
+def detect_intent(user_message, chat_history):
     """
-    Single entry point for the chatbot. Decides what context to use based on
-    what's available (JD only, JD+resume, JD+resume+fit), and answers naturally
-    without the user needing to follow any steps.
-
-    Returns (answer_text, result_type) where result_type is one of:
-    "none", "tailoring", "cover_letter", "interview_prep"
+    Figures out what the user wants based on their message and recent chat history.
+    Returns one of: "tailoring", "cover_letter", "interview_prep", "general"
     """
-    has_jd = jd_text is not None and len(jd_text.strip()) > 0
-    has_resume = resume_text is not None and len(resume_text.strip()) > 0
-    has_fit = fit_analysis is not None and len(fit_analysis.strip()) > 0
-
-    if not has_jd:
-        return ("I don't have a job description yet. Upload one using the JD attach button "
-                "below, or paste it directly into the chat and I'll take it from there."), "none"
-
     affirmative_replies = ["yes", "yes please", "sure", "go ahead", "ok", "okay", "yep", "please do", "yes please do"]
     last_bot_message = ""
     if chat_history:
@@ -195,42 +276,21 @@ def chat_response(user_message, faiss_index, chunks, jd_text, resume_text, fit_a
 
     user_said_yes = user_message.strip().lower() in affirmative_replies
 
-    wants_tailoring = (
-        (user_said_yes and "tailor" in last_bot_message) or
-        "tailor" in user_message.lower() or
-        "rewrite my resume" in user_message.lower()
-    )
-    wants_cover_letter = (
-        (user_said_yes and "cover letter" in last_bot_message) or
-        "cover letter" in user_message.lower()
-    )
-    wants_interview_prep = (
-        (user_said_yes and "interview" in last_bot_message) or
+    if (user_said_yes and "tailor" in last_bot_message) or "tailor" in user_message.lower() or "rewrite my resume" in user_message.lower():
+        return "tailoring"
+    if (user_said_yes and "cover letter" in last_bot_message) or "cover letter" in user_message.lower():
+        return "cover_letter"
+    if (user_said_yes and "interview" in last_bot_message) or (
         "interview" in user_message.lower() and (
             "prep" in user_message.lower() or "question" in user_message.lower() or "ready" in user_message.lower()
         )
-    )
+    ):
+        return "interview_prep"
+    return "general"
 
-    needs_resume_and_fit_message = (
-        "I'd need both your resume and a calculated fit score first. "
-        "Attach your resume if you haven't already, and I'll take it from there."
-    )
 
-    if wants_tailoring:
-        if has_resume and has_fit:
-            return tailor_resume(resume_text, jd_text, fit_analysis), "tailoring"
-        return needs_resume_and_fit_message, "none"
-
-    if wants_cover_letter:
-        if has_resume and has_fit:
-            return generate_cover_letter(resume_text, jd_text, fit_analysis), "cover_letter"
-        return needs_resume_and_fit_message, "none"
-
-    if wants_interview_prep:
-        if has_resume and has_fit:
-            return generate_interview_prep(resume_text, jd_text, fit_analysis), "interview_prep"
-        return needs_resume_and_fit_message, "none"
-
+def build_general_chat_messages(user_message, faiss_index, chunks, jd_text, resume_text, fit_analysis, chat_history):
+    """Builds the messages list for a general conversational response."""
     relevant_chunks = []
     if faiss_index is not None and chunks:
         relevant_chunks = search_similar_chunks(query=user_message, faiss_index=faiss_index, chunks=chunks, top_k=3)
@@ -243,6 +303,9 @@ def chat_response(user_message, faiss_index, chunks, jd_text, resume_text, fit_a
         "Never mention 'steps' or tell the user to follow a process - just respond naturally to what they ask.\n\n"
         "RELEVANT JOB DESCRIPTION CONTEXT:\n" + jd_context + "\n\n"
     )
+
+    has_fit = fit_analysis is not None and len(fit_analysis.strip()) > 0
+    has_resume = resume_text is not None and len(resume_text.strip()) > 0
 
     if has_fit:
         context_prompt += (
@@ -274,6 +337,15 @@ def chat_response(user_message, faiss_index, chunks, jd_text, resume_text, fit_a
         "mid-list. It is fine to be thorough."
     )
 
+    user_lower_check = user_message.strip().lower()
+    if user_lower_check in ["continue", "continue please", "keep going", "go on"]:
+        context_prompt += (
+            "\n\nThe user is asking you to CONTINUE your previous response, which got cut off "
+            "mid-way. Look at your last message in the conversation history below, and continue "
+            "exactly where it left off - do not repeat content you already covered, do not restart "
+            "the explanation, just pick up the next point naturally."
+        )
+
     messages = [{"role": "system", "content": context_prompt}]
 
     if chat_history:
@@ -281,16 +353,128 @@ def chat_response(user_message, faiss_index, chunks, jd_text, resume_text, fit_a
             messages.append({"role": msg["role"], "content": msg["content"]})
 
     messages.append({"role": "user", "content": user_message})
+    return messages
 
-    # Detect signals that this question likely needs a longer, detailed answer
+
+def stream_chat_response(user_message, faiss_index, chunks, jd_text, resume_text, fit_analysis, chat_history):
+    """
+    Generator version of the general chat response - yields text chunks as they
+    arrive from Groq, enabling a live 'typing' effect in the UI.
+    Only used for the general conversational path (not tailoring/cover letter/
+    interview prep, which return complete structured documents at once).
+    """
+    has_jd = jd_text is not None and len(jd_text.strip()) > 0
+    if not has_jd:
+        yield ("I don't have a job description yet. Upload one using the JD attach button "
+               "below, or paste it directly into the chat and I'll take it from there.")
+        return
+
+    user_lower = user_message.lower()
+
+    very_long_signals = [
+        "roadmap", "plan", "comprehensive", "deep dive", "deepen", "everything about",
+        "full guide", "complete guide", "all topics", "cover everything", "study plan",
+        "preparation plan", "learning path"
+    ]
     long_answer_signals = [
         "questions", "list", "examples", "in detail", "explain", "describe",
         "give me", "interview", "prepare", "scenario", "situation", "all the",
-        "write", "draft", "summary", "summarize"
+        "write", "draft", "summary", "summarize", "topics"
     ]
+
+    if user_lower.strip() in ["continue", "continue please", "keep going", "go on"]:
+        dynamic_max_tokens = 3500
+    elif any(signal in user_lower for signal in very_long_signals):
+        dynamic_max_tokens = 3500
+    elif any(signal in user_lower for signal in long_answer_signals):
+        dynamic_max_tokens = 1800
+    else:
+        dynamic_max_tokens = 500
+
+    messages = build_general_chat_messages(user_message, faiss_index, chunks, jd_text, resume_text, fit_analysis, chat_history)
+
+    stream = client.chat.completions.create(
+        model=GROQ_MODEL,
+        messages=messages,
+        temperature=0.4,
+        max_tokens=dynamic_max_tokens,
+        stream=True,
+    )
+
+    was_truncated = False
+    for chunk in stream:
+        delta = chunk.choices[0].delta.content
+        if delta:
+            yield delta
+        if chunk.choices[0].finish_reason == "length":
+            was_truncated = True
+
+    if was_truncated:
+        yield "\n\n---\n⚠️ **This got cut off because it's quite long.** Just say **\"continue\"** and I'll pick up right where I left off."
+
+
+def chat_response(user_message, faiss_index, chunks, jd_text, resume_text, fit_analysis, chat_history):
+    """
+    Non-streaming entry point, used for tailoring/cover letter/interview prep
+    (which need to return a complete result before being saved to session state
+    for later docx export) and as a fallback if streaming isn't used.
+
+    Returns (answer_text, result_type) where result_type is one of:
+    "none", "tailoring", "cover_letter", "interview_prep"
+    """
+    has_jd = jd_text is not None and len(jd_text.strip()) > 0
+    has_resume = resume_text is not None and len(resume_text.strip()) > 0
+    has_fit = fit_analysis is not None and len(fit_analysis.strip()) > 0
+
+    if not has_jd:
+        return ("I don't have a job description yet. Upload one using the JD attach button "
+                "below, or paste it directly into the chat and I'll take it from there."), "none"
+
+    intent = detect_intent(user_message, chat_history)
+
+    needs_resume_and_fit_message = (
+        "I'd need both your resume and a calculated fit score first. "
+        "Attach your resume if you haven't already, and I'll take it from there."
+    )
+
+    if intent == "tailoring":
+        if has_resume and has_fit:
+            return tailor_resume(resume_text, jd_text, fit_analysis), "tailoring"
+        return needs_resume_and_fit_message, "none"
+
+    if intent == "cover_letter":
+        if has_resume and has_fit:
+            return generate_cover_letter(resume_text, jd_text, fit_analysis), "cover_letter"
+        return needs_resume_and_fit_message, "none"
+
+    if intent == "interview_prep":
+        if has_resume and has_fit:
+            return generate_interview_prep(resume_text, jd_text, fit_analysis), "interview_prep"
+        return needs_resume_and_fit_message, "none"
+
+    messages = build_general_chat_messages(user_message, faiss_index, chunks, jd_text, resume_text, fit_analysis, chat_history)
+
     user_lower = user_message.lower()
-    needs_longer_answer = any(signal in user_lower for signal in long_answer_signals)
-    dynamic_max_tokens = 1200 if needs_longer_answer else 500
+
+    very_long_signals = [
+        "roadmap", "plan", "comprehensive", "deep dive", "deepen", "everything about",
+        "full guide", "complete guide", "all topics", "cover everything", "study plan",
+        "preparation plan", "learning path"
+    ]
+    long_answer_signals = [
+        "questions", "list", "examples", "in detail", "explain", "describe",
+        "give me", "interview", "prepare", "scenario", "situation", "all the",
+        "write", "draft", "summary", "summarize", "topics"
+    ]
+
+    if user_lower.strip() in ["continue", "continue please", "keep going", "go on"]:
+        dynamic_max_tokens = 3500
+    elif any(signal in user_lower for signal in very_long_signals):
+        dynamic_max_tokens = 3500
+    elif any(signal in user_lower for signal in long_answer_signals):
+        dynamic_max_tokens = 1800
+    else:
+        dynamic_max_tokens = 500
 
     response = client.chat.completions.create(
         model=GROQ_MODEL,
@@ -299,4 +483,8 @@ def chat_response(user_message, faiss_index, chunks, jd_text, resume_text, fit_a
         max_tokens=dynamic_max_tokens,
     )
 
-    return response.choices[0].message.content.strip(), "none"
+    result = response.choices[0].message.content.strip()
+    if response.choices[0].finish_reason == "length":
+        result += "\n\n---\n⚠️ **This got cut off because it's quite long.** Just say **\"continue\"** and I'll pick up right where I left off."
+
+    return result, "none"

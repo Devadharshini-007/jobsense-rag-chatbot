@@ -1,12 +1,21 @@
 """
-streamlit_app.py - JobSense, clean chat-only UI with native file attach in chat bar
+streamlit_app.py - JobSense, complete version with:
+- Native chat file attach (paperclip icon)
+- Smart document type detection (resume vs JD)
+- Streaming general chat responses
+- Fit score, tailored resume, cover letter, interview prep
+- Properly formatted resume docx export (not generic markdown dump)
+- Conversation history with working delete
 """
 
 import streamlit as st
 from app.embeddings import process_jd_text
-from app.rag_pipeline import calculate_fit_score, chat_response, tailor_resume
+from app.rag_pipeline import (
+    calculate_fit_score, chat_response, stream_chat_response, detect_intent
+)
 from app.pdf_utils import extract_text_from_pdf
 from app.docx_export import create_docx_from_text
+from app.resume_docx import create_resume_docx, extract_candidate_name
 from app.conversation_store import (
     init_db, save_conversation, list_conversations,
     load_conversation, delete_conversation, generate_title_from_history
@@ -20,7 +29,6 @@ st.set_page_config(
     layout="wide"
 )
 
-# Session state defaults
 defaults = {
     "faiss_index": None,
     "chunks": [],
@@ -46,11 +54,6 @@ def wants_docx_download(user_text):
 
 
 def pick_export_content():
-    """
-    Decides what content to export as docx. Prioritizes whichever was generated
-    most recently, tracked via st.session_state.last_generated_type.
-    Returns (title, content_text) or (None, None) if nothing available.
-    """
     type_to_content = {
         "tailoring": ("Tailored Resume", st.session_state.tailoring_result),
         "cover_letter": ("Cover Letter", st.session_state.cover_letter_result),
@@ -64,7 +67,6 @@ def pick_export_content():
         if content:
             return title, content
 
-    # Fallback priority order if last_generated_type is unset or its content is missing
     for key in ["tailoring", "cover_letter", "interview_prep", "fit"]:
         title, content = type_to_content[key]
         if content:
@@ -73,14 +75,14 @@ def pick_export_content():
     return None, None
 
 
+def build_export_docx(title, content):
+    if title == "Tailored Resume" and st.session_state.resume_text_raw:
+        candidate_name = extract_candidate_name(st.session_state.resume_text_raw)
+        return create_resume_docx(content, candidate_name=candidate_name)
+    return create_docx_from_text(title, content)
+
+
 def render_markdown_lite(text):
-    """
-    Converts simple markdown produced by the LLM into clean HTML:
-    - '### Heading' / '## Heading' -> bold line, no symbols, with extra spacing
-    - '**bold**' -> <strong>bold</strong>
-    - Markdown table rows ('| a | b |') -> bullet points joined by ' - ', skipping separator rows
-    - Leaves everything else as plain text with line breaks preserved
-    """
     lines = text.split("\n")
     html_lines = []
     for line in lines:
@@ -92,7 +94,6 @@ def render_markdown_lite(text):
             )
         elif stripped.startswith("|") and stripped.endswith("|"):
             cells = [c.strip() for c in stripped.strip("|").split("|")]
-            # Skip markdown separator rows like |---|---|---|
             if all(c.replace("-", "").strip() == "" for c in cells):
                 continue
             row_text = " - ".join(c for c in cells if c)
@@ -100,7 +101,6 @@ def render_markdown_lite(text):
         else:
             html_lines.append(line)
     joined = "<br>".join(html_lines)
-    # Convert **bold** to <strong>bold</strong>
     parts = joined.split("**")
     rebuilt = ""
     is_bold = False
@@ -125,11 +125,9 @@ def add_user_message(text):
 
 
 def persist_conversation():
-    """Saves the current conversation state to the database, creating a new row on first save."""
     if len(st.session_state.chat_history) == 0:
         return
     title = generate_title_from_history(st.session_state.chat_history)
-    # Strip non-serializable download buffers before saving (docx bytes don't need to be persisted)
     history_to_save = []
     for msg in st.session_state.chat_history:
         clean_msg = {"role": msg["role"], "content": msg["content"]}
@@ -148,11 +146,6 @@ def persist_conversation():
 
 
 def classify_document_type(filename, text):
-    """
-    Guesses whether an attached PDF is a resume or a job description,
-    using filename hints first, then content patterns as a fallback.
-    Returns "resume" or "jd".
-    """
     filename_lower = filename.lower()
     resume_filename_hints = ["resume", "cv", "curriculum"]
     jd_filename_hints = ["jd", "job description", "job_description", "jobdescription", "posting", "vacancy"]
@@ -162,9 +155,7 @@ def classify_document_type(filename, text):
     if any(hint in filename_lower for hint in jd_filename_hints):
         return "jd"
 
-    # Fallback: check content patterns
-    text_lower = text.lower()[:2000]  # first ~2000 chars is usually enough
-
+    text_lower = text.lower()[:2000]
     resume_signals = ["education", "experience", "skills", "objective", "career objective",
                        "projects", "certifications", "linkedin.com/in/", "github.com/"]
     jd_signals = ["responsibilities", "requirements", "we are looking for", "job description",
@@ -179,19 +170,10 @@ def classify_document_type(filename, text):
     elif jd_score > resume_score:
         return "jd"
     else:
-        # Genuine tie - fall back to whichever slot is still empty
         return "resume" if st.session_state.jd_text_raw is not None else "jd"
 
 
 def process_attached_file(uploaded_file, accompanying_text=None):
-    """
-    Decides whether an attached PDF is a JD or a resume using content-based
-    classification (not just attachment order), extracts its text, and updates
-    state + chat accordingly.
-    If accompanying_text is provided (user typed something alongside the file),
-    it's shown in the SAME message bubble as the attachment, clearly separated.
-    Returns True if a fit score calculation happened (so caller can offer tailoring).
-    """
     extracted_text = extract_text_from_pdf(uploaded_file)
 
     file_line = "📎 " + uploaded_file.name
@@ -216,7 +198,6 @@ def process_attached_file(uploaded_file, accompanying_text=None):
         add_user_message(combined_message)
 
         if st.session_state.resume_text_raw is not None:
-            # Resume was already attached - calculate fit immediately
             with st.spinner("Comparing your resume against the job..."):
                 fit_result = calculate_fit_score(st.session_state.resume_text_raw, extracted_text)
                 st.session_state.fit_result = fit_result
@@ -247,7 +228,6 @@ def process_attached_file(uploaded_file, accompanying_text=None):
         return True
 
     elif doc_type == "resume" and st.session_state.jd_text_raw is None:
-        # Resume attached before any JD exists - save it and ask for the JD
         st.session_state.resume_text_raw = extracted_text
         add_user_message(combined_message)
         add_bot_message(
@@ -256,7 +236,6 @@ def process_attached_file(uploaded_file, accompanying_text=None):
         return False
 
     else:
-        # Both already exist - treat new attachment as an updated resume
         st.session_state.resume_text_raw = extracted_text
         add_user_message(combined_message)
         with st.spinner("Re-checking your fit with this updated resume..."):
@@ -270,7 +249,6 @@ def process_attached_file(uploaded_file, accompanying_text=None):
 st.title("🧠 JobSense")
 st.caption("Your AI co-pilot for understanding any job and your fit for it.")
 
-# Sidebar - new conversation control + history
 with st.sidebar:
     st.markdown("### JobSense")
     if st.button("➕ New Conversation", use_container_width=True):
@@ -299,7 +277,6 @@ with st.sidebar:
                         st.session_state.fit_result = loaded["fit_result"]
                         st.session_state.tailoring_result = loaded["tailoring_result"]
                         st.session_state.current_conversation_id = loaded["id"]
-                        # Rebuild the FAISS index from saved JD text, since the index itself isn't stored
                         if loaded["jd_text_raw"]:
                             faiss_index, chunks = process_jd_text(loaded["jd_text_raw"])
                             st.session_state.faiss_index = faiss_index
@@ -309,11 +286,13 @@ with st.sidebar:
                             st.session_state.chunks = []
                     st.rerun()
             with col_delete:
-                if st.button("🗑", key="delete_" + str(conv["id"])):
+                delete_clicked = st.button("🗑", key="delete_" + str(conv["id"]), help="Delete this conversation")
+                if delete_clicked:
                     delete_conversation(conv["id"])
                     if conv["id"] == st.session_state.current_conversation_id:
                         for key, value in defaults.items():
                             st.session_state[key] = value
+                    st.toast("Conversation deleted")
                     st.rerun()
 
     st.divider()
@@ -324,7 +303,6 @@ with st.sidebar:
     if st.session_state.fit_result:
         st.caption("✅ Fit score calculated")
 
-# Welcome message shown once
 if len(st.session_state.chat_history) == 0:
     add_bot_message(
         "Hi! Attach a job description using the 📎 icon below (or paste it directly), "
@@ -372,7 +350,6 @@ with main_col:
                 unsafe_allow_html=True
             )
 
-# Native chat input with built-in file attach (paperclip icon)
 prompt = st.chat_input(
     "Message JobSense...",
     accept_file=True,
@@ -384,7 +361,6 @@ if prompt:
     has_text = bool(prompt.text and prompt.text.strip())
 
     if has_files:
-        # If text was typed alongside the file(s), attach it to the FIRST file's message bubble only
         text_to_attach = prompt.text.strip() if has_text else None
         for i, uploaded_file in enumerate(prompt["files"]):
             text_for_this_file = text_to_attach if i == 0 else None
@@ -396,33 +372,39 @@ if prompt:
         user_text = prompt.text.strip()
         add_user_message(user_text)
 
-        # Heuristic: long pasted text with no JD yet = treat as JD
         if st.session_state.jd_text_raw is None and len(user_text) > 300:
-            with st.spinner("Reading job description..."):
-                faiss_index, chunks = process_jd_text(user_text)
-                st.session_state.faiss_index = faiss_index
-                st.session_state.chunks = chunks
-                st.session_state.jd_text_raw = user_text
+            with main_col:
+                with st.spinner("Reading job description..."):
+                    faiss_index, chunks = process_jd_text(user_text)
+                    st.session_state.faiss_index = faiss_index
+                    st.session_state.chunks = chunks
+                    st.session_state.jd_text_raw = user_text
             add_bot_message(
                 "Thanks, I've read through that job description. Ask me anything about it, "
                 "or attach/paste your resume next and I'll check your fit."
             )
-        # Heuristic: long pasted text with JD but no resume yet = treat as resume
+            persist_conversation()
+            st.rerun()
+
         elif st.session_state.jd_text_raw is not None and st.session_state.resume_text_raw is None and len(user_text) > 300:
             st.session_state.resume_text_raw = user_text
-            with st.spinner("Comparing your resume against the job..."):
-                fit_result = calculate_fit_score(user_text, st.session_state.jd_text_raw)
-                st.session_state.fit_result = fit_result
-            st.session_state.last_generated_type = "fit"
+            with main_col:
+                with st.spinner("Comparing your resume against the job..."):
+                    fit_result = calculate_fit_score(user_text, st.session_state.jd_text_raw)
+                    st.session_state.fit_result = fit_result
+                    st.session_state.last_generated_type = "fit"
             add_bot_message(
                 "Thanks! Here's how you stack up against this role:\n\n" + fit_result +
                 "\n\n---\nWant me to tailor your resume, write a cover letter, or help you prep for the interview?"
             )
+            persist_conversation()
+            st.rerun()
+
         else:
             if wants_docx_download(user_text):
                 title, content = pick_export_content()
                 if content:
-                    docx_buffer = create_docx_from_text(title, content)
+                    docx_buffer = build_export_docx(title, content)
                     download_data = {
                         "buffer": docx_buffer.getvalue(),
                         "filename": title.replace(" ", "_") + ".docx",
@@ -437,27 +419,80 @@ if prompt:
                         "I don't have anything to export yet. Attach a JD and resume first, "
                         "or ask me something so there's content to download."
                     )
-            else:
-                with st.spinner("Thinking..."):
-                    answer, result_type = chat_response(
-                        user_text,
-                        st.session_state.faiss_index,
-                        st.session_state.chunks,
-                        st.session_state.jd_text_raw,
-                        st.session_state.resume_text_raw,
-                        st.session_state.fit_result,
-                        st.session_state.chat_history[:-1]
-                    )
-                    if result_type == "tailoring":
-                        st.session_state.tailoring_result = answer
-                        st.session_state.last_generated_type = "tailoring"
-                    elif result_type == "cover_letter":
-                        st.session_state.cover_letter_result = answer
-                        st.session_state.last_generated_type = "cover_letter"
-                    elif result_type == "interview_prep":
-                        st.session_state.interview_prep_result = answer
-                        st.session_state.last_generated_type = "interview_prep"
-                add_bot_message(answer)
+                persist_conversation()
+                st.rerun()
 
-        persist_conversation()
-        st.rerun()
+            else:
+                intent = detect_intent(user_text, st.session_state.chat_history[:-1])
+
+                if intent in ("tailoring", "cover_letter", "interview_prep"):
+                    with main_col:
+                        with st.spinner("Working on it..."):
+                            answer, result_type = chat_response(
+                                user_text,
+                                st.session_state.faiss_index,
+                                st.session_state.chunks,
+                                st.session_state.jd_text_raw,
+                                st.session_state.resume_text_raw,
+                                st.session_state.fit_result,
+                                st.session_state.chat_history[:-1]
+                            )
+                            if result_type == "tailoring":
+                                st.session_state.tailoring_result = answer
+                                st.session_state.last_generated_type = "tailoring"
+                            elif result_type == "cover_letter":
+                                st.session_state.cover_letter_result = answer
+                                st.session_state.last_generated_type = "cover_letter"
+                            elif result_type == "interview_prep":
+                                st.session_state.interview_prep_result = answer
+                                st.session_state.last_generated_type = "interview_prep"
+
+                    if result_type == "tailoring":
+                        add_bot_message(
+                            "I've put together your tailored resume - download it below to see the "
+                            "full formatted version."
+                        )
+                        candidate_name = extract_candidate_name(st.session_state.resume_text_raw)
+                        docx_buffer = create_resume_docx(answer, candidate_name=candidate_name)
+                        st.session_state.chat_history[-1]["download"] = {
+                            "buffer": docx_buffer.getvalue(),
+                            "filename": "Tailored_Resume.docx",
+                            "title": "Tailored Resume",
+                        }
+                    else:
+                        add_bot_message(answer)
+
+                    persist_conversation()
+                    st.rerun()
+
+                else:
+                    with main_col:
+                        placeholder = st.empty()
+                        full_response = ""
+                        for text_chunk in stream_chat_response(
+                            user_text,
+                            st.session_state.faiss_index,
+                            st.session_state.chunks,
+                            st.session_state.jd_text_raw,
+                            st.session_state.resume_text_raw,
+                            st.session_state.fit_result,
+                            st.session_state.chat_history[:-1]
+                        ):
+                            full_response += text_chunk
+                            placeholder.markdown(
+                                "<div style='text-align: left; padding: 8px 0 16px 0; font-size: 16px; "
+                                "color: inherit; max-width: 80%;'>"
+                                + render_markdown_lite(full_response) + " ▌"
+                                + "</div>",
+                                unsafe_allow_html=True
+                            )
+                        placeholder.markdown(
+                            "<div style='text-align: left; padding: 8px 0 16px 0; font-size: 16px; "
+                            "color: inherit; max-width: 80%;'>"
+                            + render_markdown_lite(full_response) +
+                            "</div>",
+                            unsafe_allow_html=True
+                        )
+                    add_bot_message(full_response)
+                    persist_conversation()
+                    st.rerun()
